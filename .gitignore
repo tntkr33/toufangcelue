@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime business files and generated workbooks
+private_templates/
+outputs/
+*.xls
+*.xlsx
+
+# Local editor settings
+.vscode/
+.idea/
