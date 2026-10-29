@@ -1,0 +1,97 @@
+// Run from the workspace root with PLAYWRIGHT_MODULE pointing to Playwright.
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const { execFileSync, spawn } = require('node:child_process');
+const { mkdirSync } = require('node:fs');
+const assert = require('node:assert/strict');
+const python = process.env.TEST_PYTHON || execFileSync('py',['-3.14','-c','import sys; print(sys.executable)'],{encoding:'utf8'}).trim();
+const env = {...process.env,PYTHONIOENCODING:'utf-8'};
+const py = (code, input) => execFileSync(python,['-c',code],{encoding:'utf8',env,input,maxBuffer:30*1024*1024});
+(async()=>{
+  const server=spawn(python,['-u','-c',"from strategy_excel_tool import server as s; h,_=s.create_http_server('127.0.0.1',0,s.Handler); print(h.server_address[1],flush=True); h.serve_forever()"],{env,stdio:['ignore','pipe','pipe']});
+  let browser;
+  try {
+    const port=await new Promise((resolve,reject)=>{let output='';server.stdout.on('data',d=>{output+=d;if(output.includes('\n'))resolve(Number(output.trim()));});server.once('error',reject);server.once('exit',c=>reject(Error('server exited '+c)));});
+    const url=`http://127.0.0.1:${port}`;
+    browser=await chromium.launch({channel:'msedge',headless:true});
+    const page=await browser.newPage({viewport:{width:1600,height:1100}}),errors=[];
+    page.on('pageerror',e=>errors.push(e.message));
+    await page.goto(url);
+    assert.equal(await page.locator('header .version').textContent(),py("from strategy_excel_tool.server import BUILD_VERSION; print(BUILD_VERSION)").trim());
+    const buffer=Buffer.from(py("from strategy_excel_tool import server as s; import base64; rows=[['01361','真龙（海韵）','1-30档50条。'],['01686','真龙（海韵中支）','城市、县城：10-16档2条，17-24档5条，25-30档10条。\\n乡镇、农村：10-16档1条，17-24档3条，25-30档10条。']]+[[str(70000+i),'测试品规'+str(i),'1-30档1条'] for i in range(179)]; print(base64.b64encode(s.build_demo_xlsx(['商品编码','商品名称','本期投放策略'],rows)).decode())"),'base64');
+    await page.locator('#strategyFile').setInputFiles({name:'review-test.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer});
+    const analyzed=page.waitForResponse(r=>r.url().endsWith('/api/analyze'));
+    await page.locator('#analyzeBtn').click();const initial=await (await analyzed).json();assert.equal(initial.ok,true);
+    await page.locator('#reviewPanel').waitFor({state:'visible'});
+    assert.equal(await page.locator('#reviewSearch').inputValue(),'');assert.equal(await page.locator('#reviewContent').isVisible(),false);
+    assert.equal(initial.summary.productCount,181);
+    // Search the final product, beyond the old 150-row preview limit.
+    await page.locator('#reviewSearch').fill('70178');await page.locator('#reviewResults button').click();
+    assert.match(await page.locator('#selectedProduct').textContent(),/70178/);
+    await page.locator('#reviewSearch').fill('海韵');assert.equal(await page.locator('#reviewResults button').count(),2);
+    await page.locator('#reviewResults button').filter({hasText:'01686'}).click();
+    assert.equal(await page.locator('#strategyEditor').isVisible(),false);
+    assert.equal(await page.locator('#reviewSearch').inputValue(),'');
+    const searchBox=await page.locator('#reviewSearch').boundingBox();assert.ok(searchBox.width>1400&&searchBox.height>=50);
+    const county=initial.reviewRows.find(r=>r.productCode==='01686'&&r.county.includes('凤山')).county;
+    await page.locator('#chartCounty').selectOption(county);
+    assert.equal(await page.locator('#chartCounty option').filter({hasText:' / '}).count(),0);
+    assert.equal(await page.locator('#chartMarkets button').count(),4);
+    await page.locator('#chartMarkets button').filter({hasText:'农村'}).click();
+    assert.equal(await page.locator('#chartMarkets [aria-pressed=true]').textContent(),'农村');
+    assert.equal(await page.locator('[data-chart-tier="17"] .chart-value').textContent(),'3');
+    await page.locator('[data-chart-tier="17"]').click();
+    assert.equal(await page.locator(':focus').getAttribute('data-tier'),'17');
+    await page.locator('#reviewCounty').click();await page.locator('.county-option').filter({hasText:county}).locator('[data-county-only]').click();await page.locator('#reviewMarket').selectOption('');
+    const rows=initial.reviewRows.filter(r=>r.productCode==='01686'&&r.county===county&&['城市','县城'].includes(r.marketType));
+    const shotDir='strategy_excel_tool/outputs/ui-v1.3';mkdirSync(shotDir,{recursive:true});
+    await page.evaluate(()=>scrollTo(0,0));await page.screenshot({path:shotDir+'/desktop.png',fullPage:true});
+    await page.locator('#maximizeTable').click();assert.equal(await page.locator('#quantityDialog').isVisible(),true);
+    const dialog=await page.locator('#quantityDialog').boundingBox();assert.ok(dialog.width>1550&&dialog.height>1050);
+    for(const r of rows)await page.locator(`input[data-id="${r.id}"][data-tier="30"]`).fill('100');
+    await page.screenshot({path:shotDir+'/maximized.png'});
+    assert.equal(await page.locator('#exportBtn').isDisabled(),true);
+    await page.locator('#applyNumbers').click();await page.locator('#changeDialog').waitFor({state:'visible'});
+    assert.equal(await page.locator('#changeTable tbody tr').count(),2);
+    assert.match(await page.locator('#changeTable tbody').textContent(),/100/);
+    await page.screenshot({path:shotDir+'/confirmation.png'});
+    await page.locator('#cancelChanges').click();await page.locator('#changeDialog').waitFor({state:'hidden'});
+    assert.equal(await page.locator(`input[data-id="${rows[0].id}"][data-tier="30"]`).inputValue(),'100');
+    async function verifyExport(expected) {
+      const base=url+'/api/export?sessionId='+initial.sessionId+'&filename=202610W1(10.01-10.04)';
+      const prompt=await (await page.request.get(base)).json();
+      const params=new URLSearchParams({zeroToken:prompt.zeroToken,zeroChoices:JSON.stringify(Object.fromEntries(prompt.exportProducts.map(p=>[String(p.sourceRow),'keep'])))});
+      const resp=await page.request.get(base+'&'+params);assert.ok(resp.ok());
+      const xls=(await resp.body()).toString('base64');
+      const checked=JSON.parse(py("import sys,base64,xlrd,json; b=xlrd.open_workbook(file_contents=base64.b64decode(sys.stdin.read()),formatting_info=True); s=b.sheet_by_index(0); rows=[s.row_values(i) for i in range(s.nrows) if s.cell_value(i,2)=='01686' and '凤山' in str(s.cell_value(i,5)) and s.cell_value(i,7) in ('城市','县城')]; print(json.dumps({'values':[r[8] for r in rows],'hidden':s.rowinfo_map[0].hidden}))",xls));
+      assert.deepEqual(checked.values,[expected,expected]);assert.equal(checked.hidden,1);
+    }
+    await verifyExport(10);
+    await page.locator('#applyNumbers').click();await page.locator('#changeDialog').waitFor({state:'visible'});
+    await page.locator('#confirmChanges').click();await page.locator('#changeDialog').waitFor({state:'hidden'});
+    await verifyExport(100);
+    await page.keyboard.press('Escape');await page.locator('#quantityDialog').waitFor({state:'hidden'});
+    await page.locator('#editStrategy').click();assert.equal(await page.locator('label[for="reviewText"]').textContent(),'修改当前文字策略');
+    await page.locator('#reviewText').fill('1-30档7条。');
+    await page.locator('#applyText').click();await page.locator('#changeDialog').waitFor({state:'visible'});
+    assert.equal(await page.locator('#changeTable tbody tr').count(),44*30);
+    assert.match(await page.locator('#changeWarnings').textContent(),/清除/);
+    await page.locator('#cancelChanges').click();await page.locator('#changeDialog').waitFor({state:'hidden'});
+    await verifyExport(100);
+    await page.locator('#applyText').click();await page.locator('#changeDialog').waitFor({state:'visible'});
+    await page.locator('#confirmChanges').click();await page.locator('#changeDialog').waitFor({state:'hidden'});
+    await verifyExport(7);
+    assert.match(await page.locator('#reviewOriginal').textContent(),/25-30档10条/);
+    assert.equal(await page.locator('#reviewApplied').textContent(),'1-30档7条。');
+    // Revert a draft to the applied value; it must no longer block export.
+    const first=page.locator('#reviewTable input').first();await first.fill('8');await first.fill('7');assert.equal(await page.locator('#exportBtn').isDisabled(),false);
+    await page.locator('#chartCounty').selectOption(county);await page.locator('#chartMarkets button').filter({hasText:'城市'}).click();
+    await page.locator('.chart-section').scrollIntoViewIfNeeded();await page.screenshot({path:shotDir+'/chart.png'});
+    await page.setViewportSize({width:390,height:844});await page.evaluate(()=>scrollTo(0,0));
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await page.screenshot({path:shotDir+'/mobile.png',fullPage:true});
+    await page.locator('#maximizeTable').click();await page.screenshot({path:shotDir+'/mobile-maximized.png'});
+    await page.locator('#maximizeTable').click();await page.locator('#quantityDialog').waitFor({state:'hidden'});
+    assert.deepEqual(errors,[]);
+    console.log('181 products / 7964 rows: search, chart dimensions, maximize, confirmation cancel/commit, text diff (1320 cells), XLS readback and responsive layout passed.');
+  } finally {if(browser)await browser.close();server.kill();await new Promise(r=>server.exitCode!==null?r():server.once('exit',r));}
+})().catch(e=>{console.error(e);process.exitCode=1;});

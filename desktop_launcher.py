@@ -30,7 +30,7 @@ def main():
     print("Open URL: %s" % url)
     print("Private templates folder: %s" % server.TEMPLATE_DIR)
     print("Outputs folder: %s" % server.OUTPUT_DIR)
-    print("Close this window to exit.")
+    print("Use the Exit tool button in the browser to stop the server.")
 
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

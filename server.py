@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 import zipfile
+import threading
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,22 @@ from urllib.parse import parse_qs, quote, urlparse
 from xml.etree import ElementTree as ET
 
 import xlrd
+try:
+    from .review_ui import REVIEW_JS
+    from .zero_export_ui import ZERO_EXPORT_JS
+    from .desktop_actions import SavedFiles, PageLifetime
+    from .export_review import build_export_products
+    from .ui_styles import APP_CSS
+    from .customer_service import CustomerService, CustomerStateError
+    from .customer_ui import CUSTOMER_JS, CUSTOMER_CSS
+except ImportError:
+    from review_ui import REVIEW_JS
+    from zero_export_ui import ZERO_EXPORT_JS
+    from desktop_actions import SavedFiles, PageLifetime
+    from export_review import build_export_products
+    from ui_styles import APP_CSS
+    from customer_service import CustomerService, CustomerStateError
+    from customer_ui import CUSTOMER_JS, CUSTOMER_CSS
 from xlutils.filter import XLWTWriter, XLRDReader, process
 
 
@@ -43,7 +60,8 @@ def resolve_template_dir():
 TEMPLATE_DIR = resolve_template_dir()
 OUTPUT_DIR = BASE_DIR / "outputs"
 INNER_CODE_MAPPING_FILENAME = "商品内码实例.xls"
-BUILD_VERSION = "2026-07-27.3-market-type-alias"
+BUILD_VERSION = "v2.0"
+REVIEW_LOCK = threading.RLock()
 SESSIONS = {}
 
 
@@ -58,12 +76,44 @@ def find_available_port(host="127.0.0.1", start=8010, end=8099):
     raise RuntimeError("No available local port found between %s and %s." % (start, end))
 
 
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def __init__(self, *args, **kwargs):
+        self.shutdown_token = uuid.uuid4().hex
+        self.saved_files = SavedFiles()
+        self.page_lifetime = PageLifetime()
+        self.stopping = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        with self.page_lifetime.lock:
+            if not self.stopping.is_set() and self.page_lifetime.should_stop():
+                self.stopping.set()
+                threading.Thread(target=self.shutdown, daemon=True).start()
+
+    def shutdown(self):
+        self.stopping.set()
+        super().shutdown()
+
+    def server_close(self):
+        self.stopping.set()
+        super().server_close()
+
+    def server_bind(self):
+        # Windows SO_REUSEADDR can let multiple processes share the same port.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def create_http_server(host, preferred_port, handler):
     try:
-        return ThreadingHTTPServer((host, preferred_port), handler), preferred_port
+        return LocalHTTPServer((host, preferred_port), handler), preferred_port
     except OSError:
         fallback = find_available_port(host, preferred_port + 1, preferred_port + 200)
-        return ThreadingHTTPServer((host, fallback), handler), fallback
+        return LocalHTTPServer((host, fallback), handler), fallback
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -73,7 +123,7 @@ ET.register_namespace("r", NS_REL)
 
 TEMPLATES = {
     "district_type": {
-        "label": "档位+区倒+市场类型",
+        "label": "档位+区县+市场类型",
         "filename": "档位+区倒+市场类型.xls",
         "analysisFilename": "档位+区倒+市场类型.xlsx",
         "marker": ("M200007", "2"),
@@ -156,10 +206,14 @@ def row_number(row):
     return number or 0
 
 
+TIER_RULE_PATTERN = re.compile(
+    r"(?<!\d)(\d{1,2})(?:\s*档?\s*[-~～至到]\s*(\d{1,2}))?\s*档\s*(\d+)\s*条"
+)
+
+
 def parse_rule_segments(text):
     rules = []
-    pattern = r"(\d{1,2})(?:\s*[-~～至到]\s*(\d{1,2}))?\s*档\s*(\d+)\s*条"
-    for start, end, count in re.findall(pattern, text or ""):
+    for start, end, count in TIER_RULE_PATTERN.findall(text or ""):
         a = int(start)
         b = int(end or start)
         value = int(count)
@@ -211,6 +265,13 @@ def parse_strategy_text(raw_text):
             body = body.strip()
 
         body_rules = parse_rule_segments(body)
+        if body_rules:
+            remainder = TIER_RULE_PATTERN.sub("", body)
+            if re.search(r"档|\d+\s*条", remainder):
+                warnings.append(
+                    "策略仅部分识别，请人工复核；未识别内容：%s；原文：%s"
+                    % (remainder.strip(" ，,、"), line)
+                )
 
         if label and (looks_like_county_header(label) or not looks_like_market_type_label(label)):
             current_counties = split_names(label)
@@ -819,7 +880,7 @@ def detect_template_columns(book, template_key):
         errors.append("模板缺少商品名称列。")
     for dim in target["requiredDims"]:
         if columns[dim] is None:
-            labels = {"county": "县区/区倒", "marketType": "市场类型", "businessArea": "商圈"}
+            labels = {"county": "区县", "marketType": "市场类型", "businessArea": "商圈"}
             errors.append("模板缺少%s列。" % labels[dim])
     if not columns["tierCols"]:
         errors.append("模板缺少 1档-30档列。")
@@ -1120,7 +1181,7 @@ def build_xls_output(template_key, columns, preserve_until_row_no, output_record
     return data
 
 
-def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_title=None):
+def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_title=None, edits=None, zero_choices=None):
     errors = []
     warnings = []
     xls_template_path = template_path_for_key(template_key)
@@ -1142,6 +1203,19 @@ def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_t
     open_validated_xls_template(template_key)
 
     strategy_data = read_strategy_products(strategy_bytes)
+    edits = edits or {}
+    strategy_data['warnings'] = []
+    for product in strategy_data['products']:
+        product['originalText'] = product['strategyText']
+        change = edits.get(str(product['sourceRow']), {})
+        if 'text' in change:
+            product['strategyText'] = change['text']
+            parsed = parse_strategy_text(change['text'])
+            product['rules'] = parsed['rules']
+            product['warnings'] = parsed['warnings']
+            if not parsed['rules']:
+                product['warnings'].append('没有识别到档位规则，导出时所有档位填0。')
+        strategy_data['warnings'].extend('第%s行 %s：%s' % (product['sourceRow'], product['name'], w) for w in product['warnings'])
     warnings.extend(strategy_data["warnings"])
 
     try:
@@ -1188,11 +1262,23 @@ def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_t
     preview_rows = []
     output_rows = []
     output_records = []
+    review_rows = []
     generated_rows = 0
     matched_dimension_rows = 0
     conflict_count = 0
 
+    import hashlib
+    county_names = [template_book.cell_text(template_book.row_cells(row).get(columns['county'])) for row in base_rows]
+    export_products = build_export_products(strategy_data['products'], edits, county_names)
+    zero_candidates = [p for p in export_products if p['category'] == 'stop']
+    zero_token = hashlib.sha256(json.dumps([export_products, edits], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    excluded = {str(c['sourceRow']) for c in export_products if (zero_choices or {}).get(str(c['sourceRow'])) == 'omit'}
+    if len(excluded) == len(strategy_data['products']) and excluded:
+        return {'ok': False, 'errors': ['全部品规均选择不导出，没有可导出的商品。'], 'warnings': warnings}
+
     for product in strategy_data["products"]:
+        if str(product['sourceRow']) in excluded:
+            continue
         for base_row in base_rows:
             generated_rows += 1
             new_row_no = preserve_until_row_no + generated_rows
@@ -1207,6 +1293,17 @@ def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_t
                 "hasMarketType": columns["marketType"] is not None,
             }
             assignments, matched_rules, conflicts = evaluate_product_on_dimension(product, dim, tier_cols)
+            review_id = '%s:%s' % (product['sourceRow'], row_number(base_row))
+            manual = edits.get(str(product['sourceRow']), {}).get('numbers', {}).get(review_id, {})
+            assignments.update({int(k): v for k, v in manual.items()})
+            review_rows.append({
+                'id': review_id, 'row': new_row_no, 'sourceRow': product['sourceRow'],
+                'productCode': product['code'], 'productName': product['name'],
+                'originalText': product['originalText'], 'strategyText': product['strategyText'],
+                'county': dim['county'], 'marketType': dim['marketType'], 'businessArea': dim['businessArea'],
+                'assignments': assignments.copy(), 'manualTiers': list(manual),
+                'warnings': product['warnings'],
+            })
             if matched_rules:
                 matched_dimension_rows += 1
             if conflicts:
@@ -1260,7 +1357,9 @@ def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_t
         "strategyHeaderRow": strategy_data["headerRow"],
         "templateHeaderRow": header_row_no,
         "templatePreserveUntilRow": preserve_until_row_no,
-        "productCount": len(strategy_data["products"]),
+        "productCount": len(strategy_data["products"]) - len(excluded),
+        "sourceProductCount": len(strategy_data["products"]),
+        "excludedProductCount": len(excluded),
         "innerCodeMappedProducts": len(strategy_data["products"]) - len(missing_inner_codes),
         "innerCodeMissingProducts": len(missing_inner_codes),
         "innerCodeMappingEntries": len(mapping_data["mapping"]),
@@ -1291,6 +1390,10 @@ def analyze_and_apply(strategy_bytes, template_key, write_output=False, export_t
             for product in strategy_data["products"]
         ],
         "previewRows": preview_rows,
+        "reviewRows": review_rows,
+        "zeroCandidates": zero_candidates,
+        "exportProducts": export_products,
+        "zeroToken": zero_token,
     }
     if write_output:
         result["output"] = build_xls_output(
@@ -1356,27 +1459,120 @@ def inner_code_mapping_status_payload():
     }
 
 
+def inspect_export_period(filename=None):
+    value = re.sub(r"\.(?:xlsx|xls)$", "", (filename or "").strip(), flags=re.I)
+    fallback = next_week_default_export_stem()
+    result = {'inputName': filename or '', 'period': fallback, 'requiresConfirmation': False, 'reason': ''}
+    if not value:
+        return result
+    match = re.search(r"(?<!\d)(\d{4})(\d{2})W(\d+)\((\d{2})\.(\d{2})-(\d{2})\.(\d{2})\)", value)
+    try:
+        if not match:
+            raise ValueError('无法识别周期格式，需要 YYYYMMW周次(MM.DD-MM.DD)。')
+        year, month, week, start_month, start_day, end_month, end_day = map(int, match.groups())
+        if not 1 <= month <= 12 or not 1 <= week <= 6:
+            raise ValueError('周期月份或周次无效。')
+        try:
+            start = dt.date(year, start_month, start_day)
+            end_year = year + 1 if start_month == 12 and end_month == 1 else year
+            end = dt.date(end_year, end_month, end_day)
+        except ValueError:
+            raise ValueError('起止日期不存在，请检查月份、天数和闰年。') from None
+        if month != start_month:
+            raise ValueError('周期月份与开始日期的月份不一致。')
+        if end < start:
+            raise ValueError('结束日期早于开始日期。')
+        result['period'] = match.group(0)
+    except ValueError as exc:
+        result.update(requiresConfirmation=True, reason=str(exc))
+    return result
+
+
 def export_period_from_filename(filename=None):
-    value = Path((filename or "").strip()).stem
-    match = re.search(r"\d{6}W\d+\(\d{2}\.\d{2}-\d{2}\.\d{2}\)", value)
-    return match.group(0) if match else next_week_default_export_stem()
+    return inspect_export_period(filename)['period']
 
 
-def build_export_for_session(session, requested_filename=None):
+CUSTOMERS = CustomerService(XlsxBook, REVIEW_LOCK)
+
+
+def build_export_for_session(session, requested_filename=None, zero_choices=None, zero_token=None):
+    with REVIEW_LOCK:
+        return _build_export_for_session(session, requested_filename, zero_choices, zero_token)
+
+
+def _build_export_for_session(session, requested_filename=None, zero_choices=None, zero_token=None):
+    CUSTOMERS.assert_idle(session)
+    review = session.get('review') or analyze_and_apply(session['strategy'], session['templateKey'], edits=session.get('edits'))
+    if not review.get('ok'):
+        return review
+    session['review'] = review
+    candidates = review.get('exportProducts', [])
+    expected = {str(c['sourceRow']) for c in candidates}
+    if candidates or zero_choices is not None or zero_token is not None:
+        if (zero_token != review.get('zeroToken') or not isinstance(zero_choices, dict)
+                or set(zero_choices) != expected or any(v not in ('omit', 'keep') for v in zero_choices.values())):
+            return {'ok': False, 'requiresZeroConfirmation': True, 'exportProducts': candidates,
+                    'confirmedChoices': CUSTOMERS.state(session)['choices'],
+                    'zeroToken': review.get('zeroToken'), 'sourceProductCount': review['summary']['productCount'],
+                    'errors': ['请确认最新的品规导出清单。']}
     export_title = export_period_from_filename(requested_filename)
-    cache_key = "%s|%s" % (session["templateKey"], export_title)
+    cache_key = "%s|%s|%s" % (session["templateKey"], export_title, json.dumps(zero_choices, sort_keys=True))
     if session.get("outputCacheKey") == cache_key and "output" in session:
-        return {"ok": True, "output": session["output"]}
+        if candidates:
+            CUSTOMERS.confirm_choices(session, zero_choices, zero_token)
+        return {"ok": True, "output": session["output"], 'exportSummary': session.get('exportSummary')}
     result = analyze_and_apply(
         session["strategy"],
         session["templateKey"],
         write_output=True,
         export_title=export_title,
+        edits=session.get('edits'),
+        zero_choices=zero_choices,
     )
     if result.get("ok"):
+        if candidates:
+            CUSTOMERS.confirm_choices(session, zero_choices, zero_token)
         session["output"] = result["output"]
         session["outputCacheKey"] = cache_key
+        result['exportSummary'] = result['summary']
+        session['exportSummary'] = result['summary']
     return result
+
+
+def update_review_session(session, payload, preview=False):
+    with REVIEW_LOCK:
+        CUSTOMERS.assert_idle(session)
+        source = payload.get('sourceRow')
+        rows = [r for r in session['review']['reviewRows'] if r['sourceRow'] == source]
+        if not rows:
+            raise ValueError('找不到该商品，请重新解析。')
+        edits = copy.deepcopy(session.get('edits', {}))
+        change = edits.setdefault(str(source), {})
+        if payload.get('action') == 'text':
+            value = payload.get('text')
+            if not isinstance(value, str) or len(value) > 50000:
+                raise ValueError('文字策略无效或过长。')
+            change['text'] = value
+            change['numbers'] = {}
+        elif payload.get('action') == 'numbers':
+            allowed = {r['id']: r for r in rows}
+            for item in payload.get('changes', []):
+                tier, value = item.get('tier'), item.get('value')
+                if item.get('id') not in allowed or type(tier) is not int or tier not in allowed[item['id']]['assignments']:
+                    raise ValueError('商品维度或档位无效。')
+                if type(value) is not int or not 0 <= value <= 1000000:
+                    raise ValueError('投放条数必须是0到1000000之间的整数。')
+                change.setdefault('numbers', {}).setdefault(item['id'], {})[str(tier)] = value
+        else:
+            raise ValueError('未知修改操作。')
+        result = analyze_and_apply(session['strategy'], session['templateKey'], edits=edits)
+        if result['ok'] and not preview:
+            CUSTOMERS.invalidate(session, strategy=True)
+            session['edits'] = edits
+            session['review'] = result
+            session.pop('output', None)
+            session.pop('outputCacheKey', None)
+        return result
 
 
 
@@ -1427,89 +1623,74 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>货源投放策略转导入Excel</title>
+  <title>卷烟投放策略转excel工具 __BUILD_VERSION__</title>
   <style>
-    :root { color-scheme: light; --ink:#172033; --muted:#667085; --line:#d8dee8; --bg:#f7f9fc; --brand:#0f766e; --bad:#b42318; --warn:#a15c07; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); }
-    h1 { margin:0; font-size:22px; }
-    main { max-width:1220px; margin:0 auto; padding:24px; }
-    .panel { background:#fff; border:1px solid var(--line); border-radius:8px; padding:18px; margin-bottom:16px; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-    label { display:block; font-weight:600; margin-bottom:8px; }
-    input[type=file], input[type=text], select { width:100%; border:1px solid var(--line); border-radius:6px; padding:10px; background:#fff; }
-    button { border:0; border-radius:6px; padding:10px 16px; background:var(--brand); color:#fff; cursor:pointer; font-weight:600; }
-    button:disabled { background:#9aa4b2; cursor:not-allowed; }
-    .actions { display:flex; gap:10px; align-items:center; margin-top:14px; flex-wrap:wrap; }
-    .hint { color:var(--muted); font-size:13px; margin-top:8px; line-height:1.5; }
-    .status { font-size:14px; color:var(--muted); }
-    .messages { display:grid; gap:8px; }
-    .msg { border-radius:6px; padding:10px 12px; font-size:14px; line-height:1.5; }
-    .error { background:#fff1f0; color:var(--bad); border:1px solid #ffccc7; }
-    .warning { background:#fff8eb; color:var(--warn); border:1px solid #ffd89a; }
-    .ok { background:#ecfdf3; color:#067647; border:1px solid #abefc6; }
-    table { width:100%; border-collapse:collapse; font-size:13px; background:#fff; }
-    th, td { border-bottom:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
-    th { background:#f2f5f9; font-weight:600; position:sticky; top:0; }
-    pre { max-height:360px; overflow:auto; background:#111827; color:#e5e7eb; border-radius:6px; padding:14px; font-size:12px; }
-    .table-wrap { max-height:430px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
-    .summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
-    .metric { border:1px solid var(--line); border-radius:8px; padding:12px; }
-    .metric b { display:block; font-size:22px; margin-bottom:2px; }
-    @media (max-width:820px) { .grid,.summary { grid-template-columns:1fr; } main { padding:14px; } }
+    __APP_CSS__
   </style>
 </head>
 <body>
-  <header><h1>货源投放周策略转系统导入 Excel</h1></header>
+  <header><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><h1>卷烟投放策略转excel工具</h1><span class="version">__BUILD_VERSION__</span></div><div class="actions"><span class="local-badge">本地工作台</span><button id="exitTool" class="secondary" type="button">退出工具</button></div></header>
+  <section id="exitNotice" class="panel" hidden role="status"><h2>工具已退出</h2><p>当前后台服务已停止，可以关闭此页面。若删除文件夹仍提示占用，请退出其他正在运行的工具副本。</p></section>
   <main>
-    <section class="panel">
-      <div class="grid">
+    <section class="panel" id="setupPanel">
+      <div class="setup-grid">
         <div>
-          <label for="strategyFile">1. 上传周策略表（.xlsx）</label>
+          <label for="strategyFile">周策略表</label>
           <input id="strategyFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
-          <div class="hint">程序按表头名称定位“本期投放策略”，不依赖固定列号，兼容新增“在途”等列。当前版本：<b>__BUILD_VERSION__</b></div>
+          <div class="hint">.xlsx 格式 · 按“本期投放策略”表头识别</div>
         </div>
         <div>
-          <label for="templateKey">2. 选择导出格式</label>
+          <label for="templateKey">导出格式</label>
           <select id="templateKey"></select>
           <div class="hint" id="templateHint">正在检查模板目录...</div>
         </div>
-      </div>
-      <div style="margin-top:16px;">
-        <label for="exportName">3. 导出文件名（可选）</label>
+      <div>
+        <label for="exportName">导出文件名 <span class="muted"> / 可选</span></label>
         <input id="exportName" type="text" value="__DEFAULT_EXPORT_NAME__" placeholder="__DEFAULT_EXPORT_NAME__" />
-        <div class="hint">不填写时默认使用下周日期，程序会生成真正的 Excel 97-2003 .xls 文件。</div>
+        <div class="hint">留空使用下周日期 · Excel 97-2003 .xls</div>
       </div>
-      <div class="actions">
+      </div>
+      <div class="actions setup-actions">
         <button id="analyzeBtn">解析并预览校验</button>
-        <button id="exportBtn" disabled>导出 XLS</button>
+        <button id="reviewExportBtn" class="secondary" disabled>复核品规清单</button>
+        <button id="exportBtn" class="secondary" disabled>导出 XLS</button>
         <span id="status" class="status">请先上传周策略表并完成预览。</span>
+        <span id="savedFileActions" class="actions" hidden>
+          <button id="openSavedFile" class="secondary" type="button">打开文件</button>
+          <button id="revealSavedFile" class="secondary" type="button">打开文件所在位置</button>
+        </span>
       </div>
     </section>
 
-    <section class="panel" id="messagePanel" hidden><div class="messages" id="messages"></div></section>
+    <section class="panel" id="messagePanel" hidden><details id="validationDetails"><summary id="validationTitle">校验提示</summary><div class="messages" id="messages"></div></details></section>
 
     <section class="panel" id="summaryPanel" hidden>
-      <h2 style="margin:0 0 12px;font-size:17px;">校验概览</h2>
       <div class="summary" id="summary"></div>
+      <details class="extra-metrics"><summary>更多校验信息</summary><div id="summaryExtra"></div></details>
     </section>
 
     <section class="panel" id="previewPanel" hidden>
-      <h2 style="margin:0 0 12px;font-size:17px;">导出预览（最多显示150行）</h2>
+      <details><summary>导出预览 <span class="muted"> / 前 150 行</span></summary>
       <div class="table-wrap">
         <table>
           <thead><tr><th>导出行</th><th>策略行</th><th>商品编码</th><th>商品内码</th><th>商品名称</th><th>区县</th><th>市场类型</th><th>商圈</th><th>命中规则</th><th>档位写入</th></tr></thead>
           <tbody id="previewRows"></tbody>
         </table>
       </div>
+      </details>
     </section>
 
     <section class="panel" id="rulesPanel" hidden>
-      <h2 style="margin:0 0 12px;font-size:17px;">结构化规则 JSON</h2>
+      <details><summary>结构化规则 JSON</summary>
       <pre id="rulesJson"></pre>
+      </details>
     </section>
   </main>
+  <dialog id="periodDialog" aria-labelledby="periodTitle">
+    <div class="change-header"><h2 id="periodTitle">请确认表头周期</h2></div>
+    <div class="change-scroll"><p id="periodReason" class="msg warning"></p><label>你输入的文件名</label><p id="periodInputName"></p><label>拟写入蓝色表头的默认周期</label><p id="periodProposed"></p><p class="muted">继续导出将保留文件名，但表头使用上述默认周期。返回修改不会写入导出内容。</p></div>
+    <div class="change-footer"><button id="periodBack" class="secondary" type="button">返回修改</button><button id="periodAccept" type="button">确认使用默认周期并导出</button></div>
+  </dialog>
 
   <script>
     const strategyFile = document.getElementById("strategyFile");
@@ -1520,6 +1701,62 @@ INDEX_HTML = r"""<!doctype html>
     const exportBtn = document.getElementById("exportBtn");
     const statusNode = document.getElementById("status");
     let sessionId = null;
+    const exitTool = document.getElementById('exitTool');
+    const shutdownToken = '__SHUTDOWN_TOKEN__';
+    let pageConnection;
+    let lastSavedId = null;
+    function connectPage() {
+      if (!pageConnection) pageConnection = new EventSource('/api/page-events?token=' + encodeURIComponent(shutdownToken));
+    }
+    function disconnectPage() {
+      if (pageConnection) pageConnection.close();
+      pageConnection = null;
+    }
+    connectPage();
+    window.addEventListener('pagehide', disconnectPage);
+    window.addEventListener('pageshow', connectPage);
+    async function fileAction(url, payload) {
+      const response = await fetch(url, {method:'POST', headers:{
+        'Content-Type':'application/json', 'X-Tool-Token':shutdownToken
+      }, body:JSON.stringify(payload)});
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error((data.errors || ['文件操作失败']).join('；'));
+      return data;
+    }
+    for (const [id, action] of [['openSavedFile','open'], ['revealSavedFile','reveal']]) {
+      document.getElementById(id).addEventListener('click', async event => {
+        if (!lastSavedId) return;
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { await fileAction('/api/open-export', {saveId:lastSavedId, action}); }
+        catch (error) { statusNode.textContent = '打开失败：' + error.message; }
+        finally { button.disabled = false; }
+      });
+    }
+    exitTool.addEventListener('click', async () => {
+      if (reviewBusy || analyzeBtn.disabled) return;
+      const message = dirtyReview()
+        ? '存在尚未应用的修改。退出会丢失本次解析和人工修改，已导出的文件不受影响。确定退出工具？'
+        : '请确认需要的结果已经导出。退出会清除本次解析和人工修改，并关闭当前这份工具的所有网页连接。确定退出工具？';
+      if (!confirm(message)) return;
+      setReviewBusy(true);
+      statusNode.textContent = '正在退出工具…';
+      try {
+        const response = await fetch('/api/shutdown', {method:'POST',headers:{'X-Tool-Token':shutdownToken}});
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error((data.errors || ['HTTP ' + response.status]).join('；'));
+        }
+        disconnectPage();
+        numberDrafts.clear(); textDirty = false; sessionId = null;
+        document.querySelector('main').hidden = true;
+        document.getElementById('exitNotice').hidden = false;
+        exitTool.textContent = '已退出';
+      } catch (error) {
+        setReviewBusy(false);
+        statusNode.textContent = '退出未完成：' + error.message + '。请检查程序是否仍在运行。';
+      }
+    });
 
     async function loadTemplates() {
       const resp = await fetch("/api/templates");
@@ -1534,7 +1771,8 @@ INDEX_HTML = r"""<!doctype html>
       } else {
         templateHint.textContent = missing.length
           ? "缺少私有模板：" + missing.join("、") + "。请放入：" + data.templateDirectory
-          : "私有模板和商品内码映射已就绪：" + data.templateDirectory;
+          : "模板与商品内码已就绪";
+        templateHint.title = data.templateDirectory;
       }
     }
 
@@ -1547,6 +1785,8 @@ INDEX_HTML = r"""<!doctype html>
       const list = document.getElementById("messages");
       const errors = data.errors || [];
       const warnings = data.warnings || [];
+      document.getElementById('validationTitle').textContent = errors.length ? `校验未通过 · ${errors.length} 个错误，${warnings.length} 条提示` : (warnings.length ? `校验提示 · ${warnings.length} 条待查看` : '校验通过 · 无异常');
+      document.getElementById('validationDetails').open = true;
       list.innerHTML = "";
       if (!errors.length && !warnings.length) list.innerHTML = '<div class="msg ok">校验通过：没有错误或警告。</div>';
       errors.forEach(item => list.insertAdjacentHTML("beforeend", `<div class="msg error">${escapeHtml(item)}</div>`));
@@ -1569,7 +1809,9 @@ INDEX_HTML = r"""<!doctype html>
         ["策略表头行", summary.strategyHeaderRow],
         ["模板表头行", summary.templateHeaderRow],
       ];
-      box.innerHTML = metrics.map(([label, value]) => `<div class="metric"><b>${escapeHtml(value)}</b><span>${label}</span></div>`).join("");
+      const primary = [0,1,2,5,6,7];
+      box.innerHTML = primary.map(i => metrics[i]).map(([label, value]) => `<div class="metric"><b>${escapeHtml(value)}</b><span>${label}</span></div>`).join("");
+      document.getElementById('summaryExtra').innerHTML = metrics.filter((_,i)=>!primary.includes(i)).map(([label,value])=>`<span>${label} <b>${escapeHtml(value)}</b></span>`).join('');
       document.getElementById("summaryPanel").hidden = false;
     }
 
@@ -1598,20 +1840,29 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       const form = new FormData();
-      form.append("strategyWorkbook", strategyFile.files[0]);
-      form.append("templateKey", templateKey.value);
+      const analyzedFile = strategyFile.files[0], analyzedTemplate = templateKey.value;
+      form.append("strategyWorkbook", analyzedFile);
+      form.append("templateKey", analyzedTemplate);
       analyzeBtn.disabled = true;
+      exitTool.disabled = true;
+      strategyFile.disabled = true;
+      templateKey.disabled = true;
       exportBtn.disabled = true;
       statusNode.textContent = "正在解析周策略表和模板...";
       try {
         const resp = await fetch("/api/analyze", { method: "POST", body: form });
         const data = await resp.json();
+        if (strategyFile.files[0] !== analyzedFile || templateKey.value !== analyzedTemplate) {
+          statusNode.textContent = "文件或格式已变化，请重新解析。";
+          return;
+        }
         showMessages(data);
         if (!data.ok) {
           statusNode.textContent = "校验未通过，请处理错误后重试。";
           return;
         }
         sessionId = data.sessionId;
+        reviewReceive(data);
         showSummary(data.summary);
         showPreview(data.previewRows || []);
         document.getElementById("rulesJson").textContent = JSON.stringify(data.rules, null, 2);
@@ -1622,6 +1873,9 @@ INDEX_HTML = r"""<!doctype html>
         statusNode.textContent = "解析失败：" + err.message;
       } finally {
         analyzeBtn.disabled = false;
+        exitTool.disabled = false;
+        strategyFile.disabled = false;
+        templateKey.disabled = false;
       }
     });
 
@@ -1634,15 +1888,84 @@ INDEX_HTML = r"""<!doctype html>
       return asciiMatch ? asciiMatch[1] : fallback;
     }
 
-    exportBtn.addEventListener("click", async () => {
-      if (!sessionId) return;
-      exportBtn.disabled = true;
-      statusNode.textContent = "正在生成 Excel，数据量较大时可能需要几十秒...";
+    function confirmExportPeriod(info) {
+      const dialog = document.getElementById('periodDialog');
+      document.getElementById('periodReason').textContent = info.reason;
+      document.getElementById('periodInputName').textContent = info.inputName;
+      document.getElementById('periodProposed').textContent = info.period;
+      return new Promise(resolve => {
+        dialog.returnValue = '';
+        document.getElementById('periodBack').onclick = () => dialog.close('back');
+        document.getElementById('periodAccept').onclick = () => dialog.close('accept');
+        dialog.addEventListener('close', () => resolve(dialog.returnValue === 'accept'), {once:true});
+        dialog.showModal();
+        document.getElementById('periodBack').focus();
+      });
+    }
+
+    async function reviewExportProducts(force=false) {
+      const sid=sessionId;
+      const resp=await fetch('/api/customer/state?'+new URLSearchParams({sessionId:sid}),{headers:{'X-Tool-Token':shutdownToken}});
+      const state=await resp.json();
+      if(!resp.ok||!state.ok)throw new Error((state.errors||['读取品规清单失败']).join('；'));
+      if(sid!==sessionId||dirtyReview())throw new Error('策略已变化，请重新解析或应用修改后再复核。');
+      if(!force&&state.choicesConfirmed)return state;
+      statusNode.textContent='请先复核并确认品规导出清单。';
+      const choices=await confirmZeroExport({...state,zeroToken:state.reviewToken,confirmedChoices:state.choices,reviewOnly:true});
+      if(choices===null)return null;
+      if(sid!==sessionId||dirtyReview())throw new Error('策略已变化，请重新复核。');
+      const confirmed=await fileAction('/api/customer/choices',{sessionId:sid,choices,zeroToken:state.reviewToken});
+      if(typeof onCustomerChoicesChanged==='function')onCustomerChoicesChanged();
+      return confirmed;
+    }
+    document.getElementById('reviewExportBtn').addEventListener('click',async()=>{
+      if(!sessionId||reviewBusy||dirtyReview())return;
+      setReviewBusy(true);
       try {
-        const params = new URLSearchParams({ sessionId });
-        const requestedName = (exportName.value || "").trim();
+        const state=await reviewExportProducts(true);
+        statusNode.textContent=state?'品规清单已确认，可导出 XLS。':'已取消复核，原确认状态未改变。';
+      }catch(error){statusNode.textContent='复核失败：'+error.message;}
+      finally{setReviewBusy(false);}
+    });
+
+    exportBtn.addEventListener("click", async () => {
+      if (!sessionId || reviewBusy || dirtyReview()) return;
+      setReviewBusy(true);
+      document.getElementById('savedFileActions').hidden = true;
+      lastSavedId = null;
+      statusNode.textContent = '正在检查品规复核状态…';
+      let exportStage = '复核品规清单', savedBackup = '';
+      try {
+        const confirmed=await reviewExportProducts();
+        if(!confirmed){statusNode.textContent='已取消导出，可继续复核。';return;}
+        const params = new URLSearchParams({ sessionId,zeroChoices:JSON.stringify(confirmed.choices),zeroToken:confirmed.reviewToken });
+        exportStage='选择保存位置';
+        let requestedName = (exportName.value || "").trim();
+        statusNode.textContent = '请选择保存位置；若窗口被遮挡，请查看任务栏。';
+        const chosen = await fileAction('/api/save-location', {sessionId, filename:requestedName || exportName.placeholder});
+        if (chosen.cancelled) { statusNode.textContent = '已取消保存，可再次点击导出。'; return; }
+        params.set('saveId', chosen.saveId);
+        requestedName = chosen.filename;
+        exportName.value = requestedName.replace(/\.xls$/i, '');
+        exportStage = '生成 Excel';
+        statusNode.textContent = "正在生成 Excel，请稍候...";
         if (requestedName) params.set("filename", requestedName);
-        const resp = await fetch("/api/export-save?" + params.toString());
+        let resp;
+        while (true) {
+          resp = await fetch("/api/export-save?" + params.toString(), {headers:{'X-Tool-Token':shutdownToken}});
+          if (resp.status !== 409) break;
+          const info = await resp.json();
+          if (info.requiresZeroConfirmation) {
+            throw new Error('策略或品规清单已变化，请重新复核后再次导出。');
+          }
+          if (!info.requiresConfirmation) throw new Error((info.errors || ['周期校验失败']).join('；'));
+          if (!await confirmExportPeriod(info)) {
+            statusNode.textContent = '已取消导出，请修改文件名中的周期后重试。';
+            exportName.focus();
+            return;
+          }
+          params.set('confirmedPeriod', info.period);
+        }
         if (!resp.ok) {
           let data = null;
           try { data = await resp.json(); } catch (_) {}
@@ -1651,24 +1974,26 @@ INDEX_HTML = r"""<!doctype html>
           return;
         }
         const data = await resp.json();
-        const message = "Excel 已生成并保存到：" + data.savedPath;
-        showMessages({
-          warnings: [
-            message,
-            "如果浏览器允许下载，也可以点击下载链接：" + location.origin + data.downloadUrl
-          ]
-        });
+        savedBackup = data.savedPath || '';
+        const message = '已保存到你选择的位置：' + data.selectedPath;
+        lastSavedId = data.saveId;
+        document.getElementById('savedFileActions').hidden = false;
+        showMessages({ warnings: [message, "程序备份保存到：" + data.savedPath] });
         statusNode.textContent = message;
       } catch (err) {
+        if (err.name === "AbortError") {
+          statusNode.textContent = "已取消保存，可再次点击导出。";
+          return;
+        }
         showMessages({
           errors: [
-            "导出失败：" + err.message,
-            "如果解析预览已成功但这里报 Failed to fetch，通常是单位电脑拦截本地下载请求或服务被安全软件中断。请重新打开程序，页面地址会自动换到可用端口。"
+            exportStage + "失败：" + err.message,
+            savedBackup ? "生成文件的备份在：" + savedBackup : "请检查工具是否仍在运行；此提示本身不能确定是网络限制。"
           ]
         });
         statusNode.textContent = "导出失败，请查看错误信息。";
       } finally {
-        exportBtn.disabled = false;
+        setReviewBusy(false);
       }
     });
 
@@ -1676,6 +2001,10 @@ INDEX_HTML = r"""<!doctype html>
   </script>
 </body>
 </html>"""
+
+
+INDEX_HTML = INDEX_HTML.replace('    loadTemplates();', REVIEW_JS + ZERO_EXPORT_JS + CUSTOMER_JS + '\n    loadTemplates();')
+INDEX_HTML = INDEX_HTML.replace('__APP_CSS__', APP_CSS + CUSTOMER_CSS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1707,9 +2036,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if urlparse(self.path).path == '/api/page-events':
+            self.page_events()
+            return
+        if not self.begin_request():
+            return
+        try:
+            self.handle_get()
+        finally:
+            self.server.page_lifetime.end_work()
+
+    def page_events(self):
+        token = parse_qs(urlparse(self.path).query).get('token', [''])[0]
+        if token != self.server.shutdown_token:
+            self.send_json(403, {'ok': False})
+            return
+        ident = uuid.uuid4().hex
+        with self.server.page_lifetime.lock:
+            if self.server.stopping.is_set():
+                self.send_response(204)
+                self.end_headers()
+                return
+            self.server.page_lifetime.connect(ident)
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            while not self.server.stopping.is_set():
+                self.wfile.write(b'data: alive\n\n')
+                self.wfile.flush()
+                self.server.stopping.wait(1)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            self.close_connection = True
+            self.server.page_lifetime.disconnect(ident)
+
+    def handle_get(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith('/api/customer/'):
+            self.handle_customer(parsed, False)
+            return
         if parsed.path == "/":
-            page = INDEX_HTML.replace("__BUILD_VERSION__", BUILD_VERSION).replace("__DEFAULT_EXPORT_NAME__", next_week_default_export_stem())
+            page = INDEX_HTML.replace("__BUILD_VERSION__", BUILD_VERSION).replace("__DEFAULT_EXPORT_NAME__", next_week_default_export_stem()).replace('__SHUTDOWN_TOKEN__', self.server.shutdown_token)
             self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8")
             return
         if parsed.path == "/api/version":
@@ -1735,7 +2105,7 @@ class Handler(BaseHTTPRequestHandler):
                 path.read_bytes(),
                 "application/vnd.ms-excel",
                 path.name,
-                {"X-Saved-Path": str(path)},
+                {"X-Saved-Path": quote(str(path))},
             )
             return
         if parsed.path == "/api/export-save":
@@ -1747,16 +2117,42 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(404, {"ok": False, "errors": ["预览会话已失效，请重新解析。"]})
                 return
             try:
-                result = build_export_for_session(session, requested_filename)
+                save_id = query.get('saveId', [''])[0]
+                if save_id:
+                    if self.headers.get('X-Tool-Token') != self.server.shutdown_token:
+                        self.send_json(403, {'ok': False, 'errors': ['保存请求无效，请从工具页面操作。']})
+                        return
+                    target = self.server.saved_files.target(save_id, session_id)
+                    if target.suffix.lower() != '.xls':
+                        raise ValueError('系统导入文件必须保存为 .xls。')
+                    requested_filename = target.name
+                period = inspect_export_period(requested_filename)
+                if period['requiresConfirmation'] and query.get('confirmedPeriod', [''])[0] != period['period']:
+                    self.send_json(409, dict(period, ok=False))
+                    return
+                result = build_export_for_session(session, period['period'],
+                    json.loads(query['zeroChoices'][0]) if 'zeroChoices' in query else None,
+                    query.get('zeroToken', [None])[0])
                 if not result.get("ok"):
-                    self.send_json(400, result)
+                    self.send_json(409 if result.get('requiresZeroConfirmation') else 400, result)
                     return
                 saved_path = save_export_bytes(result["output"], requested_filename)
+                selected_path = None
+                if save_id:
+                    try:
+                        selected_path = self.server.saved_files.write(save_id, session_id, result['output'])
+                    except OSError as exc:
+                        self.send_json(400, {'ok': False, 'errors': [
+                            '无法写入所选位置：%s。请检查文件是否被 WPS/Excel 占用或文件夹是否可写。' % exc,
+                            '生成文件的备份在：%s' % saved_path]})
+                        return
                 self.send_json(200, {
                     "ok": True,
                     "filename": saved_path.name,
                     "savedPath": str(saved_path),
                     "downloadUrl": "/api/download?name=%s" % quote(saved_path.name),
+                    "selectedPath": str(selected_path) if selected_path else None,
+                    "saveId": save_id or None,
                 })
             except Exception as exc:
                 self.send_json(500, {"ok": False, "errors": ["导出失败：%s" % exc]})
@@ -1770,12 +2166,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(404, {"ok": False, "errors": ["预览会话已失效，请重新解析。"]})
                 return
             try:
-                result = build_export_for_session(session, requested_filename)
+                period = inspect_export_period(requested_filename)
+                if period['requiresConfirmation'] and query.get('confirmedPeriod', [''])[0] != period['period']:
+                    self.send_json(409, dict(period, ok=False))
+                    return
+                result = build_export_for_session(session, period['period'],
+                    json.loads(query['zeroChoices'][0]) if 'zeroChoices' in query else None,
+                    query.get('zeroToken', [None])[0])
             except Exception as exc:
                 self.send_json(500, {"ok": False, "errors": [str(exc)]})
                 return
             if not result.get("ok"):
-                self.send_json(400, result)
+                self.send_json(409 if result.get('requiresZeroConfirmation') else 400, result)
                 return
             saved_path = save_export_bytes(result["output"], requested_filename)
             self.send_bytes(
@@ -1783,13 +2185,85 @@ class Handler(BaseHTTPRequestHandler):
                 result["output"],
                 "application/vnd.ms-excel",
                 saved_path.name,
-                {"X-Saved-Path": str(saved_path)},
+                {"X-Saved-Path": quote(str(saved_path))},
             )
             return
         self.send_json(404, {"ok": False, "errors": ["not_found"]})
 
     def do_POST(self):
+        if not self.begin_request():
+            return
+        try:
+            self.handle_post()
+        finally:
+            self.server.page_lifetime.end_work()
+
+    def begin_request(self):
+        with self.server.page_lifetime.lock:
+            if self.server.stopping.is_set():
+                self.send_json(503, {'ok': False, 'errors': ['工具正在退出，请重新启动。']})
+                return False
+            self.server.page_lifetime.begin_work()
+            return True
+
+    def handle_post(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith('/api/customer/'):
+            self.handle_customer(parsed, True)
+            return
+        if parsed.path in ('/api/save-location', '/api/open-export'):
+            if self.headers.get('X-Tool-Token') != self.server.shutdown_token:
+                self.send_json(403, {'ok': False, 'errors': ['文件操作请求无效，请从工具页面操作。']})
+                return
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 65536:
+                    raise ValueError('请求大小无效。')
+                payload = json.loads(self.rfile.read(length))
+                if parsed.path == '/api/save-location':
+                    if payload.get('sessionId') not in SESSIONS:
+                        raise ValueError('预览会话已失效，请重新解析。')
+                    filename = sanitize_export_filename(payload.get('filename'))
+                    result = self.server.saved_files.choose(payload['sessionId'], filename)
+                else:
+                    self.server.saved_files.open(payload.get('saveId'), payload.get('action'))
+                    result = {'ok': True}
+                self.send_json(200, result)
+            except (ValueError, OSError, TypeError) as exc:
+                self.send_json(400, {'ok': False, 'errors': [str(exc)]})
+            except Exception as exc:
+                self.send_json(500, {'ok': False, 'errors': ['文件操作失败：%s' % exc]})
+            return
+        if parsed.path == '/api/shutdown':
+            if self.headers.get('X-Tool-Token') != self.server.shutdown_token:
+                self.send_json(403, {'ok': False, 'errors': ['退出请求无效，请从工具页面操作。']})
+                return
+            with self.server.page_lifetime.lock:
+                if self.server.page_lifetime.work > 1:
+                    self.send_json(409, {'ok': False, 'errors': ['其他页面正在操作或保存窗口尚未关闭，请完成后再退出。']})
+                    return
+                self.server.stopping.set()
+            try:
+                self.send_json(200, {'ok': True})
+            finally:
+                threading.Thread(target=self.server.shutdown, daemon=False).start()
+            return
+        if parsed.path in ('/api/review', '/api/review-preview'):
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 2000000:
+                    raise ValueError('请求大小无效。')
+                payload = json.loads(self.rfile.read(length))
+                session = SESSIONS.get(payload.get('sessionId'))
+                if session is None:
+                    raise ValueError('预览会话已失效，请重新解析。')
+                result = update_review_session(session, payload, preview=parsed.path == '/api/review-preview')
+                self.send_json(200 if result['ok'] else 400, result)
+            except (ValueError, TypeError, KeyError) as exc:
+                self.send_json(400, {'ok': False, 'errors': [str(exc)]})
+            except Exception as exc:
+                self.send_json(500, {'ok': False, 'errors': ['应用修改失败：%s' % exc]})
+            return
         if parsed.path != "/api/analyze":
             self.send_json(404, {"ok": False, "errors": ["not_found"]})
             return
@@ -1817,6 +2291,7 @@ class Handler(BaseHTTPRequestHandler):
                     "strategy": strategy_file["content"],
                     "templateKey": template_key,
                     "createdAt": time.time(),
+                    "review": result,
                 }
                 result["sessionId"] = session_id
                 result["version"] = BUILD_VERSION
@@ -1825,6 +2300,69 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "errors": ["文件不是有效的 .xlsx 工作簿。"]})
         except Exception as exc:
             self.send_json(500, {"ok": False, "errors": [str(exc)]})
+
+    def handle_customer(self, parsed, post):
+        if self.headers.get('X-Tool-Token') != self.server.shutdown_token:
+            self.send_json(403, {'ok': False, 'errors': ['查询请求无效，请从工具页面操作。']})
+            return
+        try:
+            files = {}
+            if post:
+                length = int(self.headers.get('Content-Length', '0'))
+                limit = 50 * 1024 * 1024 if parsed.path == '/api/customer/upload' else 2000000
+                if not 0 < length <= limit:
+                    raise ValueError('请求大小无效，客户表不能超过50MB。')
+                content = self.rfile.read(length)
+                if parsed.path == '/api/customer/upload':
+                    payload, files = parse_multipart(self.headers, content)
+                else:
+                    payload = json.loads(content)
+                if not isinstance(payload, dict):
+                    raise ValueError('请求格式无效。')
+            else:
+                payload = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            session_id = payload.get('sessionId')
+            session = SESSIONS.get(session_id)
+            if session is None:
+                raise CustomerStateError('策略会话已失效，请先解析周策略表。')
+            route = parsed.path.removeprefix('/api/customer/')
+            if not post and route == 'state':
+                with REVIEW_LOCK:
+                    result = CUSTOMERS.state(session)
+            elif not post and route == 'options':
+                result = CUSTOMERS.options(session)
+            elif not post and route == 'export-status':
+                result = CUSTOMERS.export_status(session, payload.get('jobId'))
+            elif post and route == 'upload':
+                workbook = files.get('customerWorkbook')
+                if not workbook or not workbook['filename'].lower().endswith('.xlsx'):
+                    raise ValueError('请选择 .xlsx 格式的客户基本信息表。')
+                result = CUSTOMERS.upload(session, workbook['content'], Path(workbook['filename']).name, payload.get('reviewToken'))
+            elif post and route == 'choices':
+                result = CUSTOMERS.confirm_choices(session, payload.get('choices'), payload.get('zeroToken'))
+            elif post and route == 'query':
+                result = CUSTOMERS.query(session, payload)
+            elif post and route == 'save-location':
+                with REVIEW_LOCK:
+                    CUSTOMERS.assert_idle(session)
+                    CUSTOMERS.get_query(session, payload.get('queryId'))
+                filename = sanitize_export_filename(payload.get('filename') or '客户投放查询')
+                filename = filename[:-4] + '.xlsx'
+                result = self.server.saved_files.choose(session_id, filename, extension='.xlsx')
+                with REVIEW_LOCK:
+                    CUSTOMERS.get_query(session, payload.get('queryId'))
+            elif post and route == 'export-start':
+                result = CUSTOMERS.start_export(session, payload, self.server.saved_files, self.server.page_lifetime)
+            else:
+                self.send_json(404, {'ok': False, 'errors': ['查询接口不存在。']})
+                return
+            self.send_json(200, result)
+        except CustomerStateError as exc:
+            self.send_json(409, {'ok': False, 'errors': [str(exc)]})
+        except (ValueError, TypeError, KeyError, OSError, zipfile.BadZipFile) as exc:
+            self.send_json(400, {'ok': False, 'errors': [str(exc)]})
+        except Exception as exc:
+            self.send_json(500, {'ok': False, 'errors': ['客户查询失败：%s' % exc]})
 
     def log_message(self, format, *args):
         print("[%s] %s" % (self.log_date_time_string(), format % args))
@@ -1960,7 +2498,10 @@ def main():
         print("Preferred port %s was unavailable, switched to %s." % (args.port, actual_port))
     print("Template directory: %s" % TEMPLATE_DIR)
     print("Output directory: %s" % OUTPUT_DIR)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

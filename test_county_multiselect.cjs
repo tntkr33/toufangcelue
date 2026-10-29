@@ -1,0 +1,44 @@
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const {execFileSync}=require('node:child_process');
+const assert=require('node:assert/strict');
+const {mkdirSync}=require('node:fs');
+const py=code=>execFileSync('py',['-3.14','-c',code],{encoding:'utf8',env:{...process.env,PYTHONIOENCODING:'utf-8'}});
+(async()=>{
+  const js=py('from strategy_excel_tool.review_ui import REVIEW_JS; print(REVIEW_JS)');
+  const css=py('from strategy_excel_tool.ui_styles import APP_CSS; print(APP_CSS)');
+  const browser=await chromium.launch({channel:'msedge',headless:true});
+  try {
+    const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(2500);
+    await page.setContent('<style>'+css+'</style><div id="previewPanel"></div><button id="exportBtn"></button><button id="analyzeBtn"></button><input id="templateKey"><input id="strategyFile"><div id="statusNode"></div>');
+    await page.addScriptTag({content:`let sessionId='test'; const escapeHtml=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;'); ${js}`});
+    await page.evaluate(()=>reviewReceive({rules:[{sourceRow:2,productCode:'01361',productName:'海韵'}],reviewRows:['南丹','凤山','东兰','巴马'].flatMap((county,i)=>['城市','县城'].map((marketType,j)=>({sourceRow:2,id:i+':'+j,originalText:'1-30档5条',strategyText:'1-30档5条',warnings:[],county,marketType,businessArea:'',assignments:Object.fromEntries(Array.from({length:30},(_,t)=>[t+1,5])),manualTiers:[]})))}));
+    await page.locator('#reviewSearch').fill('海韵');await page.locator('#reviewResults button').click();
+    assert.equal(await page.locator('#reviewTable tbody input').count(),240);
+    await page.locator('#reviewTable input').first().fill('100');
+    await page.locator('#reviewCounty').click();await page.locator('#countyNone').click();
+    assert.equal(await page.locator('#reviewTable tbody input').count(),0);
+    for(const county of ['南丹','凤山','东兰'])await page.locator('#countyOptions input').filter({visible:true}).evaluateAll((nodes,name)=>nodes.find(n=>n.value===name).click(),county);
+    assert.equal(await page.locator('#reviewTable tbody input').count(),180);
+    assert.equal(await page.locator('#reviewTable input').first().inputValue(),'100');
+    const shots='strategy_excel_tool/outputs/ui-v1.9-update';mkdirSync(shots,{recursive:true});
+    await page.screenshot({path:shots+'/county-desktop.png',fullPage:true});
+    await page.locator('#countyInvert').click();assert.equal(await page.locator('#reviewTable tbody input').count(),60);
+    await page.locator('[data-county-only="1"]').click();assert.match(await page.locator('#reviewCounty').textContent(),/凤山/);
+    await page.locator('#reviewMarket').selectOption('县城');assert.equal(await page.locator('#reviewTable tbody input').count(),30);
+    await page.locator('#reviewCounty').click();await page.locator('#countyAll').click();
+    assert.equal(await page.locator('#reviewTable tbody input').count(),120);
+    await page.locator('#reviewCounty').press('Escape');assert.equal(await page.locator('#countyMenu').isVisible(),false);
+    await page.locator('#maximizeTable').click();await page.locator('#reviewCounty').click();
+    assert.equal(await page.locator('#quantityDialog #countyMenu').isVisible(),true);
+    await page.screenshot({path:shots+'/county-maximized.png'});
+    await page.locator('#countyInvert').click();assert.equal(await page.locator('#reviewTable tbody input').count(),0);
+    await page.locator('#countyMenu').press('Escape');assert.equal(await page.locator('#quantityDialog').isVisible(),true);
+    await page.locator('#maximizeTable').click();
+    await page.locator('#reviewCounty').click();await page.locator('#countyAll').click();
+    assert.equal(await page.evaluate(()=>numberDrafts.size),1);
+    assert.equal(await page.evaluate(()=>reviewData.reviewRows.length),8);
+    await page.setViewportSize({width:390,height:844});await page.screenshot({path:shots+'/county-mobile.png',fullPage:true});
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    console.log('County multi-select, none/all/invert/only, market intersection, drafts and maximized menu passed.');
+  } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
